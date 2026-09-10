@@ -1,0 +1,14 @@
+# Python virtual environments
+eyeVenv/
+venv/
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
+
+# MediaPipe model files -- large binaries, not source. Download commands
+# are documented in the relevant scripts' module docstrings:
+#   pose_landmarker.task  -- face_orientation_tracker.py / eye_rig.py
+#   face_landmarker.task  -- face_orientation_tracker.py / eye_rig.py
+*.task
