@@ -12,3 +12,7 @@ __pycache__/
 #   pose_landmarker.task  -- face_orientation_tracker.py / eye_rig.py
 #   face_landmarker.task  -- face_orientation_tracker.py / eye_rig.py
 *.task
+
+# PyInstaller build output
+build/
+dist/

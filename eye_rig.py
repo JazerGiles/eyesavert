@@ -1862,6 +1862,24 @@ class GLDisplay:
 # ==========================================================================
 # Main
 # ==========================================================================
+def resolve_resource(path: str) -> str:
+    """Find a bundled data file (the .task models). Relative paths are
+    tried against the current directory first (normal `python3 eye_rig.py`
+    use), then next to this script, then inside a PyInstaller bundle --
+    a double-clicked .app runs with cwd=/ so the first never hits there.
+    Returns the path unchanged if nothing matches, so the existing
+    'model not found' messages still fire."""
+    if os.path.isabs(path) or os.path.exists(path):
+        return path
+    for base in (getattr(sys, "_MEIPASS", None),
+                 os.path.dirname(os.path.abspath(__file__))):
+        if base:
+            candidate = os.path.join(base, path)
+            if os.path.exists(candidate):
+                return candidate
+    return path
+
+
 def main():
     ap = argparse.ArgumentParser()
     # --- camera / tracking ---
@@ -2157,6 +2175,8 @@ def main():
     ap.add_argument("--blink-duration-min", type=float, default=0.12)
     ap.add_argument("--blink-duration-max", type=float, default=0.25)
     args = ap.parse_args()
+    args.face_model = resolve_resource(args.face_model)
+    args.pose_model = resolve_resource(args.pose_model)
 
     osc_client = None
     if args.osc:
