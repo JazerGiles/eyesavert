@@ -347,18 +347,72 @@ class OneEuroFilter:
         return x_hat
 
 
+class PointSmoother:
+    """One Euro-filters the pixel points the debug overlay draws (face
+    landmark dots, face box, nose arrow, body lines/chest dot), which the
+    pose smoothers otherwise pass through raw -- so they visibly jitter
+    even when the person is still. Display only: nothing downstream reads
+    these points, so this can't change tracking or the eyes.
+
+    Defaults are sized for ~100ms lag at rest (lag ~= 1/(2*pi*min_cutoff),
+    1.6 Hz -> ~100ms) and less while moving -- beta is in pixels/s, so a
+    real ~300 px/s head move opens the cutoff to ~4.6 Hz (~35ms)."""
+
+    def __init__(self, min_cutoff: float = 1.6, beta: float = 0.01):
+        self.min_cutoff = min_cutoff
+        self.beta = beta
+        self._filters: dict[str, list] = {}
+
+    def reset(self):
+        self._filters = {}
+
+    def _smooth_flat(self, key: str, t: float, values: list) -> list:
+        filts = self._filters.get(key)
+        if filts is None or len(filts) != len(values):
+            self._filters[key] = [
+                OneEuroFilter(t, float(v), min_cutoff=self.min_cutoff, beta=self.beta)
+                for v in values]
+            return [int(round(v)) for v in values]
+        return [int(round(f(t, float(v)))) for f, v in zip(filts, values)]
+
+    def box(self, key: str, t: float, box):
+        """A flat (x0, y0, x1, y1)."""
+        if box is None:
+            self._filters.pop(key, None)
+            return None
+        return tuple(self._smooth_flat(key, t, list(box)))
+
+    def points(self, key: str, t: float, pts):
+        """A sequence of (x, y) points -> tuple of (x, y) int tuples."""
+        if pts is None:
+            self._filters.pop(key, None)
+            return None
+        flat = self._smooth_flat(key, t, [c for p in pts for c in p])
+        return tuple(zip(flat[0::2], flat[1::2]))
+
+    def point(self, key: str, t: float, pt):
+        """A single (x, y)."""
+        if pt is None:
+            self._filters.pop(key, None)
+            return None
+        return self.points(key, t, (pt,))[0]
+
+
 class OneEuroSmoother:
     _FIELDS = ("yaw_deg", "pitch_deg", "roll_deg",
                "frustum_x", "frustum_y", "approx_distance_mm")
 
-    def __init__(self, min_cutoff: float = 0.8, beta: float = 0.07):
+    def __init__(self, min_cutoff: float = 0.8, beta: float = 0.07,
+                 overlay_min_cutoff: float = 1.6, overlay_beta: float = 0.01):
         self.min_cutoff = min_cutoff
         self.beta = beta
         self._filters: dict[str, OneEuroFilter] = {}
+        self._points = PointSmoother(overlay_min_cutoff, overlay_beta)
 
     def update(self, pose: Optional[HeadPoseResult], t: float) -> Optional[HeadPoseResult]:
         if pose is None:
             self._filters = {}
+            self._points.reset()
             return None
         values = {f: getattr(pose, f) for f in self._FIELDS}
         smoothed = {}
@@ -375,7 +429,11 @@ class OneEuroSmoother:
             roll_deg=smoothed["roll_deg"],
             frustum_x=smoothed["frustum_x"], frustum_y=smoothed["frustum_y"],
             approx_distance_mm=smoothed["approx_distance_mm"],
-            bbox=pose.bbox, keypoints=pose.keypoints, nose_line=pose.nose_line,
+            # Overlay-only points get their own lighter filter (see
+            # PointSmoother). roi_box stays raw -- it's the actual crop used.
+            bbox=self._points.box("bbox", t, pose.bbox),
+            keypoints=self._points.points("keypoints", t, pose.keypoints),
+            nose_line=self._points.points("nose_line", t, pose.nose_line),
             roi_box=pose.roi_box,
         )
 
@@ -1088,14 +1146,17 @@ class BodyPoseEstimator:
 class BodyPoseSmoother:
     _FIELDS = ("frustum_x", "frustum_y", "approx_distance_mm")
 
-    def __init__(self, min_cutoff: float = 0.8, beta: float = 0.07):
+    def __init__(self, min_cutoff: float = 0.8, beta: float = 0.07,
+                 overlay_min_cutoff: float = 1.6, overlay_beta: float = 0.01):
         self.min_cutoff = min_cutoff
         self.beta = beta
         self._filters: dict[str, OneEuroFilter] = {}
+        self._points = PointSmoother(overlay_min_cutoff, overlay_beta)
 
     def update(self, pose: Optional[BodyPoseResult], t: float) -> Optional[BodyPoseResult]:
         if pose is None:
             self._filters = {}
+            self._points.reset()
             return None
         values = {f: getattr(pose, f) for f in self._FIELDS}
         smoothed = {}
@@ -1111,8 +1172,10 @@ class BodyPoseSmoother:
             frustum_x=smoothed["frustum_x"], frustum_y=smoothed["frustum_y"],
             approx_distance_mm=smoothed["approx_distance_mm"],
             distance_source=pose.distance_source,
-            chest_point=pose.chest_point, shoulder_points=pose.shoulder_points,
-            hip_points=pose.hip_points,
+            # Overlay-only points -- lighter filter, see PointSmoother.
+            chest_point=self._points.point("chest", t, pose.chest_point),
+            shoulder_points=self._points.points("shoulders", t, pose.shoulder_points),
+            hip_points=self._points.points("hips", t, pose.hip_points),
             # Passed through raw/unfiltered, same as chest_point/shoulder_points --
             # this is a first-pass validation signal (see _estimate_face_orientation),
             # not yet wired into anything latency-sensitive enough to need smoothing.
@@ -1841,6 +1904,16 @@ def main():
                           "reduces smoothing.")
     ap.add_argument("--no-smoothing", action="store_true",
                      help="Use raw per-frame pose estimates, no filtering.")
+    ap.add_argument("--overlay-min-cutoff", type=float, default=1.6,
+                     help="One Euro filter for the debug view's drawn points "
+                          "(landmark dots, face box, nose arrow, body "
+                          "lines): cutoff freq when still. Lag at rest is "
+                          "~1/(2*pi*this) -- 1.6 -> ~100ms. Lower = steadier "
+                          "dots but more lag. Display only; doesn't affect "
+                          "tracking.")
+    ap.add_argument("--overlay-beta", type=float, default=0.01,
+                     help="One Euro filter for the debug view's drawn points: "
+                          "how much speed (pixels/s) reduces smoothing.")
     ap.add_argument("--hfov", type=float, default=112.0,
                      help="Lens horizontal FOV in degrees.")
     ap.add_argument("--face-model", type=str, default="face_landmarker.task",
@@ -2166,9 +2239,11 @@ def main():
     source_hysteresis = SourceHysteresis(
         hold_face_s=args.face_hold, confirm_face_s=args.face_confirm)
     smoother = None if args.no_smoothing else OneEuroSmoother(
-        min_cutoff=args.min_cutoff, beta=args.beta)
+        min_cutoff=args.min_cutoff, beta=args.beta,
+        overlay_min_cutoff=args.overlay_min_cutoff, overlay_beta=args.overlay_beta)
     body_smoother = None if args.no_smoothing else BodyPoseSmoother(
-        min_cutoff=args.body_min_cutoff, beta=args.body_beta)
+        min_cutoff=args.body_min_cutoff, beta=args.body_beta,
+        overlay_min_cutoff=args.overlay_min_cutoff, overlay_beta=args.overlay_beta)
 
     # Render at a smaller internal resolution and let cv2.resize (a fast,
     # Eyes render on the GPU now (see GLDisplay) -- a real fragment
