@@ -46,7 +46,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Union
 
 import cv2
 import numpy as np
@@ -253,7 +253,36 @@ _POSE_LANDMARK_IDX = {
     "right_shoulder": 12,
     "left_hip": 23,
     "right_hip": 24,
+    # Facial keypoints BlazePose already includes in its 33-point body
+    # skeleton -- coarser than a dedicated face mesh, but enough for a
+    # rough solvePnP yaw/pitch estimate at ranges the FaceLandmarker
+    # fallback can't reach (see PoseYawEstimator below).
+    "nose": 0,
+    "left_eye": 2,
+    "right_eye": 5,
+    "left_ear": 7,
+    "right_ear": 8,
+    "mouth_left": 9,
+    "mouth_right": 10,
 }
+
+# Rough adult head geometry for the same 7 BlazePose facial points
+# (arbitrary units, mm-ish -- see _MODEL_POINTS_3D's identical caveat).
+# Only relative proportions matter here: solvePnP's ROTATION output is
+# scale-invariant, and position/distance already come from the torso
+# points elsewhere in BodyPoseResult, not from this. Nose tip at the
+# origin, everything else behind it (negative Z), matching
+# _MODEL_POINTS_3D's convention -- ears are further out AND further back
+# than eyes/mouth, matching real head shape.
+_POSE_FACE_MODEL_POINTS_3D = np.array([
+    (0.0, 0.0, 0.0),        # nose
+    (-33.0, 32.0, -26.0),   # left eye
+    (33.0, 32.0, -26.0),    # right eye
+    (-75.0, 20.0, -80.0),   # left ear
+    (75.0, 20.0, -80.0),    # right ear
+    (-28.0, -32.0, -24.0),  # mouth left
+    (28.0, -32.0, -24.0),   # mouth right
+], dtype=np.float64)
 
 
 def build_camera_matrix(width: int, height: int, hfov_deg: float) -> np.ndarray:
@@ -280,6 +309,10 @@ class HeadPoseResult:
     bbox: tuple
     keypoints: tuple
     nose_line: tuple
+    # Full-frame pixel box of the crop the face was found in, when it came
+    # from the ROI (crop-and-upscale) path rather than a plain full-frame
+    # detection -- None otherwise. Debug-overlay/diagnostic only.
+    roi_box: Optional[tuple] = None
 
 
 class OneEuroFilter:
@@ -343,6 +376,7 @@ class OneEuroSmoother:
             frustum_x=smoothed["frustum_x"], frustum_y=smoothed["frustum_y"],
             approx_distance_mm=smoothed["approx_distance_mm"],
             bbox=pose.bbox, keypoints=pose.keypoints, nose_line=pose.nose_line,
+            roi_box=pose.roi_box,
         )
 
 
@@ -356,8 +390,26 @@ class HeadPoseEstimator:
                  face_model_path: str = "face_landmarker.task",
                  face_detection_confidence: float = 0.5,
                  face_presence_confidence: float = 0.5,
-                 face_tracking_confidence: float = 0.5):
+                 face_tracking_confidence: float = 0.5,
+                 use_roi: bool = True, min_roi_face_px: int = 12,
+                 roi_input_size: int = 256, roi_expand: float = 2.0):
         self.width, self.height = width, height
+        # ROI (crop-and-upscale) path -- see process(). The face detector
+        # bundled with both mp.solutions.face_mesh and the Tasks
+        # FaceLandmarker is BlazeFace SHORT-range: it letterboxes the whole
+        # frame down to 128x128 before looking for a face, so with a
+        # 112-degree lens a face past ~1.5m is only a few pixels across by
+        # the time the detector sees it. Cropping around where the head
+        # already is and upscaling that crop makes a distant face look
+        # like a close one to the detector. min_face_px keeps its old
+        # meaning for full-frame detections (and now also marks the size
+        # below which the ROI path takes over); min_roi_face_px is the
+        # separate, much lower floor for faces found via a crop.
+        self.use_roi = use_roi
+        self.min_roi_face_px = min_roi_face_px
+        self.roi_input_size = roi_input_size
+        self.roi_expand = roi_expand
+        self._track_roi: Optional[tuple] = None
         self.camera_matrix = build_camera_matrix(width, height, hfov_deg)
         self.dist_coeffs = np.zeros((4, 1))
         self.min_face_px = min_face_px
@@ -371,9 +423,10 @@ class HeadPoseEstimator:
 
         # mp.solutions.face_mesh is the known-good path (self-contained
         # model, stable on macOS for years) -- but it's been dropped
-        # entirely as of mediapipe 1.0.0, and that's now the ONLY version
-        # with wheels on some platforms (confirmed: Raspberry Pi/aarch64
-        # only has 1.0.0+ available, no 0.10.x). So: use it when it's
+        # entirely as of mediapipe 1.0.0, and that's the ONLY line with
+        # wheels on some setups (Linux aarch64 wheels exist for 0.10.x only
+        # up to 0.10.18 and only for Python <= 3.12 -- so a Pi on Python
+        # 3.13 gets 1.x only). So: use it when it's
         # actually there, fall back to the Tasks API FaceLandmarker (the
         # same approach BodyPoseEstimator already uses for the body
         # fallback) when it isn't. Both produce the same landmark
@@ -398,6 +451,15 @@ class HeadPoseEstimator:
                 min_detection_confidence=0.5,
                 min_tracking_confidence=0.5,
             )
+            # Crops jump around frame to frame, which would confuse the
+            # tracking FaceMesh's internal frame-to-frame state -- give the
+            # ROI path its own stateless (static_image_mode) instance.
+            self._face_mesh_static = mp.solutions.face_mesh.FaceMesh(
+                static_image_mode=True,
+                max_num_faces=1,
+                refine_landmarks=False,
+                min_detection_confidence=0.5,
+            ) if use_roi else None
         else:
             if mp_tasks_python is None or mp_tasks_vision is None:
                 print("ERROR: mp.solutions.face_mesh is unavailable in this "
@@ -443,28 +505,139 @@ class HeadPoseEstimator:
         self._last_accept_time = None
         self._reject_since = None
 
-    def process(self, frame_bgr: np.ndarray) -> Optional[HeadPoseResult]:
-        h, w = frame_bgr.shape[:2]
-        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-
+    def _run_face(self, rgb: np.ndarray, static: bool) -> Optional[np.ndarray]:
+        """Run whichever face backend this install has on an RGB image.
+        Returns an (N, 2) array of landmark pixel coords in THAT image's
+        coordinate space, or None. static=True picks the stateless
+        instance (solutions path only -- the Tasks landmarker runs in
+        IMAGE mode and is stateless either way)."""
+        ih, iw = rgb.shape[:2]
         if self._use_solutions:
+            mesh = self._face_mesh_static if static else self._face_mesh
             rgb.flags.writeable = False
-            result = self._face_mesh.process(rgb)
+            result = mesh.process(rgb)
             if not result.multi_face_landmarks:
-                self._reset_pose_hold()
                 return None
             lm = result.multi_face_landmarks[0].landmark
         else:
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB,
+                                data=np.ascontiguousarray(rgb))
             result = self._face_landmarker.detect(mp_image)
             if not result.face_landmarks:
-                self._reset_pose_hold()
                 return None
             lm = result.face_landmarks[0]
+        return np.array([(p.x * iw, p.y * ih) for p in lm], dtype=np.float64)
+
+    def _detect_in_roi(self, frame_bgr: np.ndarray, roi: tuple):
+        """Crop a square-ish box (cx, cy, size in full-frame px) out of
+        the full-res frame, upscale it to roi_input_size, run the face
+        model on that, and map the landmarks back to full-frame pixel
+        coords. Returns (pts, roi_box) or None. Note the upscale adds no
+        real detail -- landmark precision is still bounded by how many
+        sensor pixels the face actually covers -- it just presents the
+        face at a size the short-range detector is built for."""
+        cx, cy, size = roi
+        fh, fw = frame_bgr.shape[:2]
+        half = max(size, 16.0) / 2.0
+        x0 = int(round(max(0.0, cx - half)))
+        x1 = int(round(min(float(fw), cx + half)))
+        y0 = int(round(max(0.0, cy - half)))
+        y1 = int(round(min(float(fh), cy + half)))
+        if x1 - x0 < 8 or y1 - y0 < 8:
+            return None
+        crop = frame_bgr[y0:y1, x0:x1]
+        scale = self.roi_input_size / float(max(crop.shape[:2]))
+        interp = cv2.INTER_LINEAR if scale >= 1.0 else cv2.INTER_AREA
+        crop_up = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=interp)
+        # Color-convert only the small resized crop, not the full frame --
+        # in steady-state ROI tracking the full frame is never converted.
+        pts = self._run_face(cv2.cvtColor(crop_up, cv2.COLOR_BGR2RGB), static=True)
+        if pts is None:
+            return None
+        sx = crop_up.shape[1] / float(crop.shape[1])
+        sy = crop_up.shape[0] / float(crop.shape[0])
+        pts[:, 0] = pts[:, 0] / sx + x0
+        pts[:, 1] = pts[:, 1] / sy + y0
+        return pts, (x0, y0, x1, y1)
+
+    def _roi_from_pts(self, pts: np.ndarray) -> tuple:
+        x0, y0 = pts.min(axis=0)
+        x1, y1 = pts.max(axis=0)
+        return ((x0 + x1) / 2.0, (y0 + y1) / 2.0,
+                max(x1 - x0, y1 - y0) * self.roi_expand)
+
+    @staticmethod
+    def _face_width(pts: np.ndarray) -> float:
+        return float(pts[:, 0].max() - pts[:, 0].min())
+
+    def process(self, frame_bgr: np.ndarray,
+                head_hint: Optional[tuple] = None) -> Optional[HeadPoseResult]:
+        """head_hint: optional (cx, cy, size) full-frame px box around
+        where the body tracker thinks the head is (BodyPoseResult.head_roi).
+
+        Search order, stopping at the first hit:
+          1. The crop around last frame's face (ROI tracking). Once ANY
+             face is acquired, steady state is one face-model call per
+             frame on a small crop -- no full-frame color conversion, no
+             full-frame detection, and no second call through the body
+             hint. Same idea as MediaPipe's own internal tracking, done
+             by hand so it also works for distant/turned faces.
+          2. Full frame, as before. A hit at least min_face_px wide is
+             used as-is (close-range behavior is unchanged from before
+             the ROI path existed); a smaller hit is re-run on a crop
+             around itself rather than rejected.
+          3. The crop around head_hint from the body tracker -- the case
+             where the face is too small for the full-frame detector to
+             see at all.
+        """
+        h, w = frame_bgr.shape[:2]
+
+        pts: Optional[np.ndarray] = None
+        roi_box: Optional[tuple] = None
+
+        if self.use_roi and self._track_roi is not None:
+            hit = self._detect_in_roi(frame_bgr, self._track_roi)
+            if hit is not None:
+                pts, roi_box = hit
+
+        if pts is None:
+            rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            full = self._run_face(rgb, static=False)
+            if full is not None:
+                if self._face_width(full) >= self.min_face_px:
+                    pts = full
+                elif self.use_roi:
+                    hit = self._detect_in_roi(frame_bgr, self._roi_from_pts(full))
+                    if hit is not None:
+                        pts, roi_box = hit
+
+        if pts is None and self.use_roi and head_hint is not None:
+            hit = self._detect_in_roi(frame_bgr, head_hint)
+            if hit is not None:
+                pts, roi_box = hit
+
+        if pts is None:
+            self._track_roi = None
+            self._reset_pose_hold()
+            return None
+
+        face_w = self._face_width(pts)
+        min_w = self.min_roi_face_px if roi_box is not None else self.min_face_px
+        if face_w < min_w:
+            self._track_roi = None
+            self._reset_pose_hold()
+            return None
+
+        # Always ROI-track the next frame from this face, at any size.
+        # (The first version only did this for small faces, so a close but
+        # TURNED face -- one the full-frame detector misses -- paid for a
+        # failed full-frame call plus a body-hint crop every frame, halving
+        # the processing rate.) If the crop ever misses, this same call
+        # falls straight through to full-frame + body-hint reacquisition.
+        self._track_roi = self._roi_from_pts(pts) if self.use_roi else None
 
         def px(idx):
-            p = lm[idx]
-            return (p.x * w, p.y * h)
+            return (pts[idx, 0], pts[idx, 1])
 
         image_points = np.array([
             px(_LANDMARK_IDX["nose_tip"]),
@@ -518,18 +691,11 @@ class HeadPoseEstimator:
         nose_end = (int(nose_end_2d[0, 0, 0]), int(nose_end_2d[0, 0, 1]))
         nose_start = (int(image_points[0][0]), int(image_points[0][1]))
 
-        xs = [p.x for p in lm]
-        ys = [p.y for p in lm]
-        cx_norm = (min(xs) + max(xs)) / 2.0
-        cy_norm = (min(ys) + max(ys)) / 2.0
-        frustum_x = cx_norm * 2.0 - 1.0
-        frustum_y = cy_norm * 2.0 - 1.0
-        bbox = (int(min(xs) * w), int(min(ys) * h),
-                int(max(xs) * w), int(max(ys) * h))
-
-        if (bbox[2] - bbox[0]) < self.min_face_px:
-            self._reset_pose_hold()
-            return None
+        x_min, y_min = pts.min(axis=0)
+        x_max, y_max = pts.max(axis=0)
+        frustum_x = ((x_min + x_max) / 2.0 / w) * 2.0 - 1.0
+        frustum_y = ((y_min + y_max) / 2.0 / h) * 2.0 - 1.0
+        bbox = (int(x_min), int(y_min), int(x_max), int(y_max))
 
         lx, ly = px(_LANDMARK_IDX["left_eye_outer"])
         rx, ry = px(_LANDMARK_IDX["right_eye_outer"])
@@ -550,11 +716,14 @@ class HeadPoseEstimator:
             approx_distance_mm=approx_distance_mm, bbox=bbox,
             keypoints=tuple((int(x), int(y)) for x, y in image_points),
             nose_line=(nose_start, nose_end),
+            roi_box=roi_box,
         )
 
     def close(self):
         if self._use_solutions:
             self._face_mesh.close()
+            if self._face_mesh_static is not None:
+                self._face_mesh_static.close()
         else:
             self._face_landmarker.close()
 
@@ -574,6 +743,20 @@ class BodyPoseResult:
     chest_point: tuple
     shoulder_points: Optional[tuple]
     hip_points: Optional[tuple]
+    # Rough, solvePnP-derived head orientation from BlazePose's own
+    # facial keypoints (see _POSE_FACE_MODEL_POINTS_3D) -- None whenever
+    # any of the 7 points isn't trusted-visible that frame. Coarser than
+    # HeadPoseResult's dedicated-face-mesh yaw/pitch; this exists
+    # specifically for the range FaceLandmarker's short-range detector
+    # can't reach.
+    yaw_deg: Optional[float] = None
+    pitch_deg: Optional[float] = None
+    # (cx, cy, size) full-frame px box around the head, from BlazePose's
+    # facial keypoints -- handed to HeadPoseEstimator as a crop hint so the
+    # face mesh can run at ranges the full-frame face detector can't see.
+    # Looser visibility requirement than yaw/pitch above (it only has to
+    # say roughly WHERE the head is). None when there's not enough to go on.
+    head_roi: Optional[tuple] = None
 
 
 class BodyPoseEstimator:
@@ -630,21 +813,39 @@ class BodyPoseEstimator:
     DEFAULT_MAX_POSITION_VELOCITY_PER_S = 3.0  # frustum units/s -- full width/height span is 2.0
     DEFAULT_STABILITY_CONFIRM_S = 0.15
 
+    # Empirically-measured fixed offset in _estimate_face_orientation's
+    # pitch output: facing the camera dead-on read +9 to +14 degrees
+    # rather than ~0 across several real readings on the Pi, while yaw
+    # stayed correctly centered near 0 -- a constant bias (not jitter),
+    # most likely from _POSE_FACE_MODEL_POINTS_3D's guessed geometry not
+    # quite matching real proportions/camera mounting, rather than a
+    # sign or unwrap bug (which would show up as a much larger or
+    # direction-dependent error). Same fudge-factor spirit as
+    # HeadPoseEstimator's pitch-unwrap/sign-flip correction. Exposed as
+    # a constructor param (not just hardcoded) since it may need
+    # re-tuning per physical camera mount.
+    DEFAULT_POSE_PITCH_BIAS_DEG = 10.0
+
     def __init__(self, width: int, height: int, camera_matrix: np.ndarray,
                  model_path: str, min_body_px: int = 40,
                  visibility_enter: float = DEFAULT_VISIBILITY_ENTER,
                  visibility_exit: float = DEFAULT_VISIBILITY_EXIT,
                  max_distance_velocity_mm_s: float = DEFAULT_MAX_DISTANCE_VELOCITY_MM_S,
                  max_position_velocity_per_s: float = DEFAULT_MAX_POSITION_VELOCITY_PER_S,
-                 stability_confirm_s: float = DEFAULT_STABILITY_CONFIRM_S):
+                 stability_confirm_s: float = DEFAULT_STABILITY_CONFIRM_S,
+                 pose_pitch_bias_deg: float = DEFAULT_POSE_PITCH_BIAS_DEG,
+                 head_hint_visibility: float = 0.3):
         self.width, self.height = width, height
+        self.head_hint_visibility = head_hint_visibility
         self.camera_matrix = camera_matrix
+        self.dist_coeffs = np.zeros((4, 1))
         self.min_body_px = min_body_px
         self.visibility_enter = visibility_enter
         self.visibility_exit = visibility_exit
         self.max_distance_velocity_mm_s = max_distance_velocity_mm_s
         self.max_position_velocity_per_s = max_position_velocity_per_s
         self.stability_confirm_s = stability_confirm_s
+        self.pose_pitch_bias_deg = pose_pitch_bias_deg
         self._shoulders_trusted = False
         self._hips_trusted = False
         self._prev_frustum_x: Optional[float] = None
@@ -792,6 +993,9 @@ class BodyPoseEstimator:
             self._blocked = False
             print("[body] resuming -- readings stable again")
 
+        yaw_deg, pitch_deg = self._estimate_face_orientation(lm, w, h)
+        head_roi = self._head_roi(lm, w, h)
+
         return BodyPoseResult(
             frustum_x=frustum_x, frustum_y=frustum_y,
             approx_distance_mm=approx_distance_mm,
@@ -799,7 +1003,83 @@ class BodyPoseEstimator:
             chest_point=(int(cx_px), int(cy_px)),
             shoulder_points=((int(ls[0]), int(ls[1])), (int(rs[0]), int(rs[1]))) if shoulders_ok else None,
             hip_points=((int(lh[0]), int(lh[1])), (int(rh[0]), int(rh[1]))) if hips_ok else None,
+            yaw_deg=yaw_deg, pitch_deg=pitch_deg,
+            head_roi=head_roi,
         )
+
+    def _head_roi(self, lm, w: int, h: int) -> Optional[tuple]:
+        """Rough head box from whichever BlazePose facial keypoints are
+        visible enough. Needs the nose plus at least two others. Size is
+        the larger of (point span x 2) and (eye spacing x 5) -- the eye
+        term keeps the box head-sized when the ears aren't visible and
+        the remaining points cluster in the middle of the face. Generous
+        on purpose: this comes from the 15fps body worker, so the person
+        may have moved a bit by the time the crop is taken."""
+        names = ("nose", "left_eye", "right_eye", "left_ear", "right_ear",
+                 "mouth_left", "mouth_right")
+        seen = {}
+        for name in names:
+            p = lm[_POSE_LANDMARK_IDX[name]]
+            if p.visibility is None or p.visibility >= self.head_hint_visibility:
+                seen[name] = (p.x * w, p.y * h)
+        if "nose" not in seen or len(seen) < 3:
+            return None
+        xy = np.array(list(seen.values()), dtype=np.float64)
+        x0, y0 = xy.min(axis=0)
+        x1, y1 = xy.max(axis=0)
+        size = max(x1 - x0, y1 - y0) * 2.0
+        if "left_eye" in seen and "right_eye" in seen:
+            (lx, ly), (rx, ry) = seen["left_eye"], seen["right_eye"]
+            size = max(size, math.hypot(rx - lx, ry - ly) * 5.0)
+        size = max(size, 32.0)
+        return ((x0 + x1) / 2.0, (y0 + y1) / 2.0, size)
+
+    def _estimate_face_orientation(self, lm, w: int, h: int):
+        """Rough yaw/pitch from BlazePose's own facial keypoints (nose,
+        eyes, ears, mouth corners) via the same solvePnP technique
+        HeadPoseEstimator uses on a dedicated face mesh -- coarser, since
+        these are 7 of 33 body landmarks rather than a purpose-built face
+        model, but reuses this call's own already-computed landmarks (no
+        extra inference) and works at ranges the FaceLandmarker fallback's
+        short-range detector can't reach. First-pass simplicity: requires
+        ALL 7 points trusted-visible (no partial-subset fallback like
+        shoulders/hips get, and no angular-velocity gate against flips
+        like HeadPoseEstimator's -- both worth adding once we've seen how
+        noisy this actually is in practice). Returns (None, None) when
+        unavailable."""
+        face_names = ("nose", "left_eye", "right_eye", "left_ear", "right_ear",
+                      "mouth_left", "mouth_right")
+        pts = [lm[_POSE_LANDMARK_IDX[name]] for name in face_names]
+        if not all(p.visibility is None or p.visibility >= self.visibility_enter for p in pts):
+            return None, None
+
+        image_points = np.array([(p.x * w, p.y * h) for p in pts], dtype=np.float64)
+        ok, rvec, _tvec = cv2.solvePnP(
+            _POSE_FACE_MODEL_POINTS_3D, image_points,
+            self.camera_matrix, self.dist_coeffs,
+            flags=cv2.SOLVEPNP_ITERATIVE,
+        )
+        if not ok:
+            return None, None
+
+        rot_mat, _ = cv2.Rodrigues(rvec)
+        pose_mat = cv2.hconcat([rot_mat, np.zeros((3, 1))])
+        _, _, _, _, _, _, euler = cv2.decomposeProjectionMatrix(pose_mat)
+        pitch, yaw, roll = [float(a) for a in euler.flatten()]
+
+        # Same decomposeProjectionMatrix quirk + sign flip as
+        # HeadPoseEstimator (see its process() comments for the full
+        # explanation) -- this model follows the same nose-at-Z=0,
+        # everything-else-behind convention, so the same correction
+        # should apply, but that's worth confirming empirically once
+        # this is actually running rather than assumed.
+        if pitch > 90:
+            pitch -= 180
+        elif pitch < -90:
+            pitch += 180
+        pitch = -pitch - self.pose_pitch_bias_deg
+
+        return yaw, pitch
 
     def close(self):
         self._landmarker.close()
@@ -833,6 +1113,11 @@ class BodyPoseSmoother:
             distance_source=pose.distance_source,
             chest_point=pose.chest_point, shoulder_points=pose.shoulder_points,
             hip_points=pose.hip_points,
+            # Passed through raw/unfiltered, same as chest_point/shoulder_points --
+            # this is a first-pass validation signal (see _estimate_face_orientation),
+            # not yet wired into anything latency-sensitive enough to need smoothing.
+            yaw_deg=pose.yaw_deg, pitch_deg=pose.pitch_deg,
+            head_roi=pose.head_roi,
         )
 
 
@@ -949,7 +1234,7 @@ class GazeTrigger:
     def is_facing(self) -> bool:
         return self._is_facing
 
-    def update(self, pose: Optional[HeadPoseResult], now: float):
+    def update(self, pose: Optional[Union[HeadPoseResult, BodyPoseResult]], now: float):
         if pose is None:
             self._facing_since = None
             if self._is_facing:
@@ -1000,6 +1285,12 @@ def draw_debug_overlay(frame: np.ndarray, pose: Optional[HeadPoseResult],
         return vw - x if mirror else x
 
     if pose is not None:
+        if pose.roi_box is not None:
+            rx0, ry0, rx1, ry1 = pose.roi_box
+            rbx0, rbx1 = sorted((mx(rx0), mx(rx1)))
+            cv2.rectangle(vis, (rbx0, ry0), (rbx1, ry1), (255, 0, 255), 1)
+            cv2.putText(vis, "roi", (rbx0, max(0, ry0 - 4)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 0, 255), 1)
         x0, y0, x1, y1 = pose.bbox
         box_x0, box_x1 = sorted((mx(x0), mx(x1)))
         cv2.rectangle(vis, (box_x0, y0), (box_x1, y1), (0, 255, 0), 2)
@@ -1024,8 +1315,10 @@ def draw_debug_overlay(frame: np.ndarray, pose: Optional[HeadPoseResult],
             cv2.line(vis, (mx(lx), ly), (mx(rx), ry), (255, 128, 0), 2)
         cx, cy = body_pose.chest_point
         cv2.circle(vis, (mx(cx), cy), 6, (255, 128, 0), -1)
+        yaw_txt = (f" yaw {body_pose.yaw_deg:+.1f} pitch {body_pose.pitch_deg:+.1f}"
+                   if body_pose.yaw_deg is not None else "")
         cv2.putText(vis, f"BODY (no face) dist ~{body_pose.approx_distance_mm:.0f}mm "
-                         f"[{body_pose.distance_source}]",
+                         f"[{body_pose.distance_source}]{yaw_txt}",
                     (mx(cx) - 80, cy - 20), cv2.FONT_HERSHEY_SIMPLEX,
                     0.6, (255, 128, 0), 2)
     return vis
@@ -1040,11 +1333,22 @@ class SaccadeWander:
     def __init__(self, radius: float = 0.5,
                  hold_range: tuple = (0.6, 2.5),
                  move_range: tuple = (0.08, 0.25),
+                 upward_bias: float = 0.0,
+                 upward_spread_deg: float = 70.0,
                  seed: Optional[int] = None,
                  now: Optional[float] = None):
         self.radius = radius
         self.hold_range = hold_range
         self.move_range = move_range
+        # Probability a freshly-picked target is drawn from a cone around
+        # straight up instead of the full circle -- used only for idle
+        # wander, to mimic a cartoon "looking around suspiciously" tic
+        # (glancing upward more than other directions, without ever
+        # eliminating them). 0.0 (default) reproduces the old
+        # full-circle-only behavior, so averting is unaffected unless
+        # explicitly given a nonzero bias.
+        self.upward_bias = upward_bias
+        self.upward_spread = math.radians(upward_spread_deg)
         self._rng = random.Random(seed)
 
         self._from = (0.0, 0.0)
@@ -1054,7 +1358,15 @@ class SaccadeWander:
         self._duration = self._rng.uniform(*hold_range)
 
     def _new_target(self):
-        angle = self._rng.uniform(0.0, 2.0 * math.pi)
+        # Positive y is "up" in this pipeline's stare-space (see main()'s
+        # frustum_y negation comment on the real-tracking branch) -- angle
+        # = pi/2 points straight up in the (cos, sin) parameterization
+        # below.
+        if self.upward_bias > 0.0 and self._rng.random() < self.upward_bias:
+            angle = self._rng.uniform(math.pi / 2 - self.upward_spread,
+                                       math.pi / 2 + self.upward_spread)
+        else:
+            angle = self._rng.uniform(0.0, 2.0 * math.pi)
         r = self.radius * math.sqrt(self._rng.uniform(0.0, 1.0))
         return (r * math.cos(angle), r * math.sin(angle))
 
@@ -1555,6 +1867,27 @@ def main():
     ap.add_argument("--min-face-px", type=int, default=60,
                      help="Reject face detections narrower than this many "
                           "pixels.")
+    ap.add_argument("--no-face-roi", dest="face_roi", action="store_false",
+                     help="Disable the crop-and-upscale path for distant "
+                          "faces (ROI tracking + body-tracker head hint) -- "
+                          "full-frame face detection only, as before.")
+    ap.add_argument("--min-roi-face-px", type=int, default=12,
+                     help="Reject faces found via a crop if narrower than "
+                          "this many FULL-FRAME pixels. Much lower than "
+                          "--min-face-px since the crop path exists for "
+                          "exactly those small faces; raise it if distant "
+                          "yaw/pitch is too noisy to be useful.")
+    ap.add_argument("--roi-size", type=int, default=256,
+                     help="Size (px, long side) each head crop is resized "
+                          "to before running the face model on it.")
+    ap.add_argument("--roi-expand", type=float, default=2.0,
+                     help="Crop box size relative to the face's landmark "
+                          "span when tracking a distant face frame to "
+                          "frame -- bigger tolerates faster motion, smaller "
+                          "makes the face larger in the crop.")
+    ap.add_argument("--head-hint-max-age", type=float, default=0.25,
+                     help="Seconds -- ignore the body tracker's head box "
+                          "if its result is older than this.")
     ap.add_argument("--max-angular-velocity", type=float, default=500.0,
                      help="Degrees/second -- reject an implausible solvePnP "
                           "rotation jump (steep-angle pose ambiguity).")
@@ -1621,6 +1954,13 @@ def main():
                           "spurious, internally-unstable detection rather "
                           "than eventually accepting whatever it settles "
                           "on.")
+    ap.add_argument("--pose-pitch-bias", type=float,
+                     default=BodyPoseEstimator.DEFAULT_POSE_PITCH_BIAS_DEG,
+                     help="Degrees subtracted from the body-derived pitch "
+                          "estimate (see BodyPoseEstimator._estimate_face_"
+                          "orientation) to correct a fixed offset measured "
+                          "facing the camera dead-on -- re-tune if the "
+                          "camera's physical mount changes.")
     ap.add_argument("--body-min-cutoff", type=float, default=0.3,
                      help="One Euro filter (body position/distance): "
                           "cutoff freq when signal is still. Separate from "
@@ -1691,6 +2031,22 @@ def main():
     ap.add_argument("--eye-beta", type=float, default=0.02,
                      help="One Euro filter (eyes): how much speed reduces "
                           "smoothing.")
+    ap.add_argument("--track-min-cutoff", type=float, default=0.5,
+                     help="One Euro filter (eyes), used only while actually "
+                          "looking toward a tracked person (not idle/avert): "
+                          "lower than --eye-min-cutoff on purpose, so this "
+                          "specific motion reads as slower/more deliberate.")
+    ap.add_argument("--track-beta", type=float, default=0.01,
+                     help="One Euro filter (eyes), tracking only -- see "
+                          "--track-min-cutoff.")
+    ap.add_argument("--track-speed-jitter", type=float, default=0.3,
+                     help="Fractional per-pair variation (+/-) applied to "
+                          "--track-min-cutoff/--track-beta, fixed once at "
+                          "startup -- makes the pairs settle onto a "
+                          "tracked person at slightly different (not "
+                          "drastically different) speeds instead of in "
+                          "lockstep. Doesn't affect idle wander or "
+                          "averting, which stay uniform/fast.")
     ap.add_argument("--no-wander", action="store_true",
                      help="Disable idle saccade wander -- rest dead-center "
                           "when nobody's tracked.")
@@ -1699,6 +2055,13 @@ def main():
     ap.add_argument("--wander-hold-max", type=float, default=2.5)
     ap.add_argument("--wander-move-min", type=float, default=0.08)
     ap.add_argument("--wander-move-max", type=float, default=0.25)
+    ap.add_argument("--idle-upward-bias", type=float, default=0.4,
+                     help="Probability (0..1) that a new idle-wander "
+                          "target is drawn from a cone around straight up "
+                          "rather than the full circle -- a cartoon "
+                          "'looking around suspiciously' tic. 0 disables "
+                          "it (old uniform behavior). Idle wander only; "
+                          "averting is unaffected.")
     ap.add_argument("--eye-mode-confirm", type=int, default=3,
                      help="Consecutive frames is_facing (or 'nobody "
                           "tracked') must agree before the eyes actually "
@@ -1758,7 +2121,11 @@ def main():
                                    face_model_path=args.face_model,
                                    face_detection_confidence=args.face_detect_confidence,
                                    face_presence_confidence=args.face_presence_confidence,
-                                   face_tracking_confidence=args.face_track_confidence)
+                                   face_tracking_confidence=args.face_track_confidence,
+                                   use_roi=args.face_roi,
+                                   min_roi_face_px=args.min_roi_face_px,
+                                   roi_input_size=args.roi_size,
+                                   roi_expand=args.roi_expand)
 
     body_worker = None
     if args.body_fallback:
@@ -1777,13 +2144,14 @@ def main():
                     visibility_exit=args.visibility_exit,
                     max_distance_velocity_mm_s=args.max_distance_velocity,
                     max_position_velocity_per_s=args.max_position_velocity,
-                    stability_confirm_s=args.stability_confirm)
+                    stability_confirm_s=args.stability_confirm,
+                    pose_pitch_bias_deg=args.pose_pitch_bias)
                 body_worker = BodyPoseWorker(cam, body_estimator, target_fps=args.body_fps).start()
             except Exception as e:
                 print(f"[body] failed to start PoseLandmarker ({e}) -- "
                       "continuing face-only.")
 
-    def handle_facing(pose: HeadPoseResult):
+    def handle_facing(pose: Union[HeadPoseResult, BodyPoseResult]):
         print(f"[trigger] eye contact: yaw={pose.yaw_deg:+.1f} "
               f"pitch={pose.pitch_deg:+.1f} dist={pose.approx_distance_mm:.0f}mm "
               f"frustum=({pose.frustum_x:+.2f},{pose.frustum_y:+.2f})")
@@ -1811,7 +2179,8 @@ def main():
     idle_wanders = [
         SaccadeWander(radius=args.wander_radius,
                       hold_range=(args.wander_hold_min, args.wander_hold_max),
-                      move_range=(args.wander_move_min, args.wander_move_max))
+                      move_range=(args.wander_move_min, args.wander_move_max),
+                      upward_bias=args.idle_upward_bias)
         for _ in range(n)
     ]
     avert_wanders = [
@@ -1827,6 +2196,18 @@ def main():
     ]
     eye_filt_x: list = [None] * n
     eye_filt_y: list = [None] * n
+    # Fixed per-pair "personality" for the tracking-a-person case only (see
+    # the eye-targeting block below) -- each pair's One Euro filter gets
+    # scaled by its own factor so the 9 pairs settle onto a tracked person
+    # at slightly different speeds instead of in perfect lockstep. Rolled
+    # once at startup, not per-movement: that's simpler than inventing a
+    # "new target" event for what's otherwise a continuously-updating
+    # signal, and still reads as "different speeds" since it's the actual
+    # per-frame convergence rate that differs between pairs, continuously.
+    track_speed_factor = [
+        random.uniform(1.0 - args.track_speed_jitter, 1.0 + args.track_speed_jitter)
+        for _ in range(n)
+    ]
     was_facing = False
     # Count-based debounce right at the point the eyes decide their mode
     # (tracking / idle wander / averting) -- see ValueDebouncer. Separate
@@ -1857,15 +2238,40 @@ def main():
                 continue
             last_frame_ts = ts
 
-            pose_raw = estimator.process(frame)
+            # Grab the body result BEFORE face processing so its head box
+            # can steer the face model's crop (see HeadPoseEstimator.process).
+            # Raw (unsmoothed) result on purpose -- smoothing lags, and the
+            # crop wants where the head is now, not a filtered history.
+            body_pose, body_ts = body_worker.latest() if body_worker is not None else (None, 0.0)
+            head_hint = None
+            if (body_pose is not None and body_pose.head_roi is not None
+                    and time.monotonic() - body_ts <= args.head_hint_max_age):
+                head_hint = body_pose.head_roi
+
+            pose_raw = estimator.process(frame, head_hint)
             now = time.monotonic()
             pose = source_hysteresis.update(pose_raw, now)
-            body_pose, _ = body_worker.latest() if body_worker is not None else (None, 0.0)
             if smoother is not None:
                 pose = smoother.update(pose, now)
             if body_smoother is not None:
                 body_pose = body_smoother.update(body_pose, now)
-            trigger.update(pose, now)
+
+            # Feed whichever source is currently active into the same
+            # GazeTrigger instance, so is_facing/averting carries across
+            # the face<->body handoff exactly like position tracking
+            # already does. GazeTrigger only reads .yaw_deg (plus a few
+            # more fields inside handle_facing's print), and
+            # BodyPoseResult happens to share those field names, so it
+            # duck-types straight in -- but only once body_pose actually
+            # has a yaw estimate (all 7 facial keypoints were trusted
+            # that frame); otherwise this frame carries no facing signal
+            # at all, same as pose being None.
+            if pose is not None:
+                trigger.update(pose, now)
+            elif body_pose is not None and body_pose.yaw_deg is not None:
+                trigger.update(body_pose, now)
+            else:
+                trigger.update(None, now)
             proc_count += 1
 
             # Single source-of-truth for what's currently tracked --
@@ -1877,7 +2283,8 @@ def main():
                 lx, ly, dist = pose.frustum_x, pose.frustum_y, pose.approx_distance_mm
             elif body_pose is not None:
                 source = 2
-                yaw, pitch = 0.0, 0.0
+                yaw = body_pose.yaw_deg if body_pose.yaw_deg is not None else 0.0
+                pitch = body_pose.pitch_deg if body_pose.pitch_deg is not None else 0.0
                 lx, ly, dist = body_pose.frustum_x, body_pose.frustum_y, body_pose.approx_distance_mm
             else:
                 source = 0
@@ -1901,8 +2308,10 @@ def main():
             was_facing = is_facing
 
             if is_facing and not args.no_avert:
+                eye_mode = "avert"
                 raw_targets = [w.update(now) for w in avert_wanders]
             elif no_track and not args.no_wander:
+                eye_mode = "idle"
                 raw_targets = [w.update(now) for w in idle_wanders]
             else:
                 # frustum_y is image-space (-1 top .. +1 bottom), but the
@@ -1910,6 +2319,7 @@ def main():
                 # side of whatever offset it's given -- negate here (see
                 # eye_display.py's original comment for how this was
                 # confirmed).
+                eye_mode = "track"
                 raw_targets = [(lx, -ly)] * n
 
             if args.no_smoothing:
@@ -1922,8 +2332,22 @@ def main():
                         eye_filt_x[i] = OneEuroFilter(now, tx, min_cutoff=args.eye_min_cutoff, beta=args.eye_beta)
                         eye_filt_y[i] = OneEuroFilter(now, ty, min_cutoff=args.eye_min_cutoff, beta=args.eye_beta)
                         eye_smoothed.append((tx, ty))
+                        continue
+                    # Only the "actually looking at a tracked person"
+                    # case gets the slower, per-pair-staggered response --
+                    # idle wander and averting both reuse the same filter
+                    # objects (for continuity, no pop when switching
+                    # modes) but always at the uniform base speed, so
+                    # averting stays exactly as quick/simultaneous as
+                    # before.
+                    if eye_mode == "track":
+                        factor = track_speed_factor[i]
+                        eye_filt_x[i].min_cutoff = eye_filt_y[i].min_cutoff = args.track_min_cutoff * factor
+                        eye_filt_x[i].beta = eye_filt_y[i].beta = args.track_beta * factor
                     else:
-                        eye_smoothed.append((eye_filt_x[i](now, tx), eye_filt_y[i](now, ty)))
+                        eye_filt_x[i].min_cutoff = eye_filt_y[i].min_cutoff = args.eye_min_cutoff
+                        eye_filt_x[i].beta = eye_filt_y[i].beta = args.eye_beta
+                    eye_smoothed.append((eye_filt_x[i](now, tx), eye_filt_y[i](now, ty)))
 
             openness = [1.0] * n if args.no_blink else [b.update(now) for b in blinkers]
 
@@ -1945,13 +2369,17 @@ def main():
             if now - last_direction_print >= 0.5:
                 if pose is not None:
                     label = direction_label(pose.yaw_deg, pose.pitch_deg)
+                    via = " (roi)" if pose.roi_box is not None else ""
                     print(f"[pose] yaw={pose.yaw_deg:+.1f} "
-                          f"pitch={pose.pitch_deg:+.1f} -> {label}")
+                          f"pitch={pose.pitch_deg:+.1f} "
+                          f"dist~{pose.approx_distance_mm:.0f}mm -> {label}{via}")
                 elif body_pose is not None:
+                    yaw_txt = (f" yaw={body_pose.yaw_deg:+.1f} pitch={body_pose.pitch_deg:+.1f}"
+                               if body_pose.yaw_deg is not None else " yaw=n/a")
                     print(f"[pose] no face -- body tracked at "
                           f"frustum=({body_pose.frustum_x:+.2f},{body_pose.frustum_y:+.2f}) "
                           f"dist~{body_pose.approx_distance_mm:.0f}mm "
-                          f"[{body_pose.distance_source}]")
+                          f"[{body_pose.distance_source}]{yaw_txt}")
                 else:
                     print("[pose] no face or body detected")
                 last_direction_print = now

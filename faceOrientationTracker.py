@@ -156,7 +156,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Union
 
 import cv2
 import numpy as np
@@ -380,7 +380,36 @@ _POSE_LANDMARK_IDX = {
     "right_shoulder": 12,
     "left_hip": 23,
     "right_hip": 24,
+    # Facial keypoints BlazePose already includes in its 33-point body
+    # skeleton -- coarser than a dedicated face mesh, but enough for a
+    # rough solvePnP yaw/pitch estimate at ranges the FaceLandmarker
+    # fallback can't reach (see BodyPoseEstimator._estimate_face_orientation).
+    "nose": 0,
+    "left_eye": 2,
+    "right_eye": 5,
+    "left_ear": 7,
+    "right_ear": 8,
+    "mouth_left": 9,
+    "mouth_right": 10,
 }
+
+# Rough adult head geometry for the same 7 BlazePose facial points
+# (arbitrary units, mm-ish -- see _MODEL_POINTS_3D's identical caveat).
+# Only relative proportions matter here: solvePnP's ROTATION output is
+# scale-invariant, and position/distance already come from the torso
+# points elsewhere in BodyPoseResult, not from this. Nose tip at the
+# origin, everything else behind it (negative Z), matching
+# _MODEL_POINTS_3D's convention -- ears are further out AND further back
+# than eyes/mouth, matching real head shape.
+_POSE_FACE_MODEL_POINTS_3D = np.array([
+    (0.0, 0.0, 0.0),        # nose
+    (-33.0, 32.0, -26.0),   # left eye
+    (33.0, 32.0, -26.0),    # right eye
+    (-75.0, 20.0, -80.0),   # left ear
+    (75.0, 20.0, -80.0),    # right ear
+    (-28.0, -32.0, -24.0),  # mouth left
+    (28.0, -32.0, -24.0),   # mouth right
+], dtype=np.float64)
 
 
 def build_camera_matrix(width: int, height: int, hfov_deg: float) -> np.ndarray:
@@ -801,6 +830,14 @@ class BodyPoseResult:
                                         # either shoulder isn't visible enough
     hip_points: Optional[tuple]        # ((lx,ly), (rx,ry)) px, or None if
                                         # either hip isn't visible enough
+    # Rough, solvePnP-derived head orientation from BlazePose's own
+    # facial keypoints (see _POSE_FACE_MODEL_POINTS_3D) -- None whenever
+    # any of the 7 points isn't trusted-visible that frame. Coarser than
+    # HeadPoseResult's dedicated-face-mesh yaw/pitch; this exists
+    # specifically for the range FaceLandmarker's short-range detector
+    # can't reach.
+    yaw_deg: Optional[float] = None
+    pitch_deg: Optional[float] = None
 
 
 class BodyPoseEstimator:
@@ -872,21 +909,37 @@ class BodyPoseEstimator:
     DEFAULT_MAX_POSITION_VELOCITY_PER_S = 3.0  # frustum units/s -- full width/height span is 2.0
     DEFAULT_STABILITY_CONFIRM_S = 0.15
 
+    # Empirically-measured fixed offset in _estimate_face_orientation's
+    # pitch output: facing the camera dead-on read +9 to +14 degrees
+    # rather than ~0 across several real readings on the Pi, while yaw
+    # stayed correctly centered near 0 -- a constant bias (not jitter),
+    # most likely from _POSE_FACE_MODEL_POINTS_3D's guessed geometry not
+    # quite matching real proportions/camera mounting, rather than a
+    # sign or unwrap bug (which would show up as a much larger or
+    # direction-dependent error). Same fudge-factor spirit as
+    # HeadPoseEstimator's pitch-unwrap/sign-flip correction. Exposed as
+    # a constructor param (not just hardcoded) since it may need
+    # re-tuning per physical camera mount.
+    DEFAULT_POSE_PITCH_BIAS_DEG = 10.0
+
     def __init__(self, width: int, height: int, camera_matrix: np.ndarray,
                  model_path: str, min_body_px: int = 40,
                  visibility_enter: float = DEFAULT_VISIBILITY_ENTER,
                  visibility_exit: float = DEFAULT_VISIBILITY_EXIT,
                  max_distance_velocity_mm_s: float = DEFAULT_MAX_DISTANCE_VELOCITY_MM_S,
                  max_position_velocity_per_s: float = DEFAULT_MAX_POSITION_VELOCITY_PER_S,
-                 stability_confirm_s: float = DEFAULT_STABILITY_CONFIRM_S):
+                 stability_confirm_s: float = DEFAULT_STABILITY_CONFIRM_S,
+                 pose_pitch_bias_deg: float = DEFAULT_POSE_PITCH_BIAS_DEG):
         self.width, self.height = width, height
         self.camera_matrix = camera_matrix
+        self.dist_coeffs = np.zeros((4, 1))
         self.min_body_px = min_body_px
         self.visibility_enter = visibility_enter
         self.visibility_exit = visibility_exit
         self.max_distance_velocity_mm_s = max_distance_velocity_mm_s
         self.max_position_velocity_per_s = max_position_velocity_per_s
         self.stability_confirm_s = stability_confirm_s
+        self.pose_pitch_bias_deg = pose_pitch_bias_deg
         self._shoulders_trusted = False
         self._hips_trusted = False
         self._prev_frustum_x: Optional[float] = None
@@ -1051,6 +1104,8 @@ class BodyPoseEstimator:
             self._blocked = False
             print("[body] resuming -- readings stable again")
 
+        yaw_deg, pitch_deg = self._estimate_face_orientation(lm, w, h)
+
         return BodyPoseResult(
             frustum_x=frustum_x, frustum_y=frustum_y,
             approx_distance_mm=approx_distance_mm,
@@ -1058,7 +1113,55 @@ class BodyPoseEstimator:
             chest_point=(int(cx_px), int(cy_px)),
             shoulder_points=((int(ls[0]), int(ls[1])), (int(rs[0]), int(rs[1]))) if shoulders_ok else None,
             hip_points=((int(lh[0]), int(lh[1])), (int(rh[0]), int(rh[1]))) if hips_ok else None,
+            yaw_deg=yaw_deg, pitch_deg=pitch_deg,
         )
+
+    def _estimate_face_orientation(self, lm, w: int, h: int):
+        """Rough yaw/pitch from BlazePose's own facial keypoints (nose,
+        eyes, ears, mouth corners) via the same solvePnP technique
+        HeadPoseEstimator uses on a dedicated face mesh -- coarser, since
+        these are 7 of 33 body landmarks rather than a purpose-built face
+        model, but reuses this call's own already-computed landmarks (no
+        extra inference) and works at ranges the FaceLandmarker fallback's
+        short-range detector can't reach. First-pass simplicity: requires
+        ALL 7 points trusted-visible (no partial-subset fallback like
+        shoulders/hips get, and no angular-velocity gate against flips
+        like HeadPoseEstimator's -- both worth adding once we've seen how
+        noisy this actually is in practice). Returns (None, None) when
+        unavailable."""
+        face_names = ("nose", "left_eye", "right_eye", "left_ear", "right_ear",
+                      "mouth_left", "mouth_right")
+        pts = [lm[_POSE_LANDMARK_IDX[name]] for name in face_names]
+        if not all(p.visibility is None or p.visibility >= self.visibility_enter for p in pts):
+            return None, None
+
+        image_points = np.array([(p.x * w, p.y * h) for p in pts], dtype=np.float64)
+        ok, rvec, _tvec = cv2.solvePnP(
+            _POSE_FACE_MODEL_POINTS_3D, image_points,
+            self.camera_matrix, self.dist_coeffs,
+            flags=cv2.SOLVEPNP_ITERATIVE,
+        )
+        if not ok:
+            return None, None
+
+        rot_mat, _ = cv2.Rodrigues(rvec)
+        pose_mat = cv2.hconcat([rot_mat, np.zeros((3, 1))])
+        _, _, _, _, _, _, euler = cv2.decomposeProjectionMatrix(pose_mat)
+        pitch, yaw, roll = [float(a) for a in euler.flatten()]
+
+        # Same decomposeProjectionMatrix quirk + sign flip as
+        # HeadPoseEstimator (see its process() comments for the full
+        # explanation) -- this model follows the same nose-at-Z=0,
+        # everything-else-behind convention, so the same correction
+        # should apply, but that's worth confirming empirically once
+        # this is actually running rather than assumed.
+        if pitch > 90:
+            pitch -= 180
+        elif pitch < -90:
+            pitch += 180
+        pitch = -pitch - self.pose_pitch_bias_deg
+
+        return yaw, pitch
 
     def close(self):
         self._landmarker.close()
@@ -1100,6 +1203,10 @@ class BodyPoseSmoother:
             distance_source=pose.distance_source,
             chest_point=pose.chest_point, shoulder_points=pose.shoulder_points,
             hip_points=pose.hip_points,
+            # Passed through raw/unfiltered, same as chest_point/shoulder_points --
+            # this is a first-pass validation signal (see _estimate_face_orientation),
+            # not yet wired into anything latency-sensitive enough to need smoothing.
+            yaw_deg=pose.yaw_deg, pitch_deg=pose.pitch_deg,
         )
 
 
@@ -1250,7 +1357,7 @@ class GazeTrigger:
     def is_facing(self) -> bool:
         return self._is_facing
 
-    def update(self, pose: Optional[HeadPoseResult], now: float):
+    def update(self, pose: Optional[Union[HeadPoseResult, BodyPoseResult]], now: float):
         if pose is None:
             self._facing_since = None
             if self._is_facing:
@@ -1457,6 +1564,13 @@ def main():
                           "spurious, internally-unstable detection rather "
                           "than eventually accepting whatever it settles "
                           "on.")
+    ap.add_argument("--pose-pitch-bias", type=float,
+                     default=BodyPoseEstimator.DEFAULT_POSE_PITCH_BIAS_DEG,
+                     help="Degrees subtracted from the body-derived pitch "
+                          "estimate (see BodyPoseEstimator._estimate_face_"
+                          "orientation) to correct a fixed offset measured "
+                          "facing the camera dead-on -- re-tune if the "
+                          "camera's physical mount changes.")
     ap.add_argument("--body-min-cutoff", type=float, default=0.3,
                      help="One Euro filter (body position/distance): "
                           "cutoff freq when signal is still. Separate from "
@@ -1544,7 +1658,8 @@ def main():
                     visibility_exit=args.visibility_exit,
                     max_distance_velocity_mm_s=args.max_distance_velocity,
                     max_position_velocity_per_s=args.max_position_velocity,
-                    stability_confirm_s=args.stability_confirm)
+                    stability_confirm_s=args.stability_confirm,
+                    pose_pitch_bias_deg=args.pose_pitch_bias)
                 body_worker = BodyPoseWorker(cam, body_estimator, target_fps=args.body_fps).start()
             except Exception as e:
                 print(f"[body] failed to start PoseLandmarker ({e}) -- "
@@ -1574,10 +1689,13 @@ def main():
             yaw, pitch = pose.yaw_deg, pose.pitch_deg
             fx, fy, dist = pose.frustum_x, pose.frustum_y, pose.approx_distance_mm
         elif body_pose is not None:
-            # Position only -- yaw/pitch aren't derivable from shoulder
-            # geometry, so they're reported as 0 (unknown), not a guess.
+            # yaw/pitch come from BlazePose's own facial keypoints when
+            # available (see BodyPoseEstimator._estimate_face_orientation);
+            # 0.0 here means no yaw estimate this frame (not "facing
+            # forward"), same as the position-only case used to report.
             source = 2
-            yaw, pitch = 0.0, 0.0
+            yaw = body_pose.yaw_deg if body_pose.yaw_deg is not None else 0.0
+            pitch = body_pose.pitch_deg if body_pose.pitch_deg is not None else 0.0
             fx, fy, dist = (body_pose.frustum_x, body_pose.frustum_y,
                              body_pose.approx_distance_mm)
         else:
@@ -1592,7 +1710,7 @@ def main():
                 print(f"[trigger] failed to send OSC message: {e}")
                 _osc_error_printed = True
 
-    def handle_facing(pose: HeadPoseResult):
+    def handle_facing(pose: Union[HeadPoseResult, BodyPoseResult]):
         print(f"[trigger] eye contact: yaw={pose.yaw_deg:+.1f} "
               f"pitch={pose.pitch_deg:+.1f} dist={pose.approx_distance_mm:.0f}mm "
               f"frustum=({pose.frustum_x:+.2f},{pose.frustum_y:+.2f})")
@@ -1641,7 +1759,23 @@ def main():
                 pose = smoother.update(pose, now)
             if body_smoother is not None:
                 body_pose = body_smoother.update(body_pose, now)
-            trigger.update(pose, now)
+
+            # Feed whichever source is currently active into the same
+            # GazeTrigger instance, so is_facing carries across the
+            # face<->body handoff exactly like position tracking already
+            # does. GazeTrigger only reads .yaw_deg (plus a few more
+            # fields inside handle_facing's print), and BodyPoseResult
+            # happens to share those field names, so it duck-types
+            # straight in -- but only once body_pose actually has a yaw
+            # estimate (all 7 facial keypoints were trusted that frame);
+            # otherwise this frame carries no facing signal at all, same
+            # as pose being None.
+            if pose is not None:
+                trigger.update(pose, now)
+            elif body_pose is not None and body_pose.yaw_deg is not None:
+                trigger.update(body_pose, now)
+            else:
+                trigger.update(None, now)
             stream_osc(trigger.is_facing, pose, body_pose)
             proc_count += 1
 
@@ -1686,8 +1820,10 @@ def main():
                         cv2.line(vis, (mx(lx), ly), (mx(rx), ry), (255, 128, 0), 2)
                     cx, cy = body_pose.chest_point
                     cv2.circle(vis, (mx(cx), cy), 6, (255, 128, 0), -1)
+                    yaw_txt = (f" yaw {body_pose.yaw_deg:+.1f} pitch {body_pose.pitch_deg:+.1f}"
+                               if body_pose.yaw_deg is not None else "")
                     cv2.putText(vis, f"BODY (no face) dist ~{body_pose.approx_distance_mm:.0f}mm "
-                                     f"[{body_pose.distance_source}]",
+                                     f"[{body_pose.distance_source}]{yaw_txt}",
                                 (mx(cx) - 80, cy - 20), cv2.FONT_HERSHEY_SIMPLEX,
                                 0.6, (255, 128, 0), 2)
                 cv2.imshow("face orientation tracker", vis)
@@ -1701,10 +1837,12 @@ def main():
                     print(f"[pose] yaw={pose.yaw_deg:+.1f} "
                           f"pitch={pose.pitch_deg:+.1f} -> {label}")
                 elif body_pose is not None:
+                    yaw_txt = (f" yaw={body_pose.yaw_deg:+.1f} pitch={body_pose.pitch_deg:+.1f}"
+                               if body_pose.yaw_deg is not None else " yaw=n/a")
                     print(f"[pose] no face -- body tracked at "
                           f"frustum=({body_pose.frustum_x:+.2f},{body_pose.frustum_y:+.2f}) "
                           f"dist~{body_pose.approx_distance_mm:.0f}mm "
-                          f"[{body_pose.distance_source}]")
+                          f"[{body_pose.distance_source}]{yaw_txt}")
                 else:
                     print("[pose] no face or body detected")
                 last_direction_print = now
