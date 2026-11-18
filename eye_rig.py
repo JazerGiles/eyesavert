@@ -139,7 +139,7 @@ class AutoBrighten:
 class CameraStream:
     def __init__(self, index: int, width: int, height: int, fps: int,
                  fourcc: str = "MJPG", backend: Optional[int] = None,
-                 auto_brighten_enabled: bool = True,
+                 auto_brighten_enabled: bool = False,
                  target_brightness: float = 120.0, min_gain: float = 0.25,
                  max_gain: float = 4.0, brighten_slew: float = 0.5):
         backend = backend if backend is not None else _default_backend()
@@ -1890,12 +1890,17 @@ def main():
     ap.add_argument("--height", type=int, default=720,
                      help="Camera capture height (see --eye-height for the "
                           "eyes window instead).")
-    ap.add_argument("--no-auto-brighten", dest="auto_brighten",
-                     action="store_false",
-                     help="Disable the software auto-brightness (on by "
+    ap.add_argument("--auto-brighten", dest="auto_brighten",
+                     action="store_true",
+                     help="Enable the software auto-brightness (off by "
                           "default). Bipolar -- brightens dark scenes AND "
                           "dims overexposed ones, slewed to avoid flicker "
                           "-- see AutoBrighten.")
+    ap.add_argument("--no-auto-brighten", dest="auto_brighten",
+                     action="store_false",
+                     help="Disable auto-brightness (already the default; "
+                          "kept so older commands still work).")
+    ap.set_defaults(auto_brighten=False)
     ap.add_argument("--target-brightness", type=float, default=120.0,
                      help="Auto-brighten target mean brightness (0-255).")
     ap.add_argument("--min-gain", type=float, default=0.25,
